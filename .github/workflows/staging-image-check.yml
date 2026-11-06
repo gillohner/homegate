@@ -1,0 +1,87 @@
+name: Staging image check
+
+# Fork-only check: builds the Homegate image from this branch and runs it against Postgres with
+# a staging-like [apple_verification] block (placeholder Services ID).
+on:
+  push:
+    branches:
+      - ci/staging-image-check
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: homegate
+          POSTGRES_PASSWORD: homegate
+          POSTGRES_DB: pubky_homegate
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd="pg_isready -U homegate"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (linux/amd64)
+        run: docker build --progress=plain -t homegate:staging-check .
+
+      - name: Stand-in homeserver admin API (Homegate reads GET /info at startup)
+        run: |
+          cat > admin.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b'{"public_key":"8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo"}' if self.path == "/info" else b""
+                  self.send_response(200 if self.path == "/info" else 404)
+                  self.send_header("content-type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(body)
+          HTTPServer(("127.0.0.1", 6288), H).serve_forever()
+          PY
+          nohup python3 admin.py > admin.log 2>&1 &
+          for i in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:6288/info && break; sleep 0.5; done
+
+      - name: Run with and without [apple_verification]
+        run: |
+          set -euo pipefail
+          mkdir -p on off
+          base='database_url = "postgres://homegate:homegate@127.0.0.1:5432/pubky_homegate"
+          http_listen_socket = "0.0.0.0:PORT"
+
+          [homeserver]
+          admin_api_url = "http://127.0.0.1:6288"
+          admin_password = "placeholder"
+          '
+          printf '%s\n[apple_verification]\nallowed_audiences = ["app.pubky.passport.staging"]\n' "${base/PORT/8080}" > on/config.toml
+          printf '%s\n' "${base/PORT/8081}" > off/config.toml
+          docker run -d --name on --network host -v "$PWD/on:/root/.homegate" homegate:staging-check
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+          docker run -d --name off --network host -v "$PWD/off:/root/.homegate" homegate:staging-check
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8081/ && break; sleep 1; done
+
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          expect() { if [ "$2" = "$3" ]; then echo "ok   $1: $3"; else echo "FAIL $1: expected $2, got $3"; failed=1; fi; }
+          forged=(-H 'content-type: application/json' -d '{"appleIdToken":"eyJhbGciOiJSUzI1NiIsImtpZCI6IngifQ.eyJpc3MiOiJodHRwczovL2FwcGxlaWQuYXBwbGUuY29tIn0.c2ln"}')
+          failed=0
+          expect "on POST /apple_verification forged" 401 "$(code "${forged[@]}" http://127.0.0.1:8080/apple_verification)"
+          expect "on body" invalid_apple_id_token "$(curl -s "${forged[@]}" http://127.0.0.1:8080/apple_verification)"
+          expect "on log: Apple verification enabled" 1 "$(docker logs on 2>&1 | grep -c 'Apple verification enabled')"
+          expect "on log: migration applied" 1 "$(docker logs on 2>&1 | grep -c 'Migration m20261105_create_apple_verifications applied successfully')"
+          expect "on log: no JWKS override" 0 "$(docker logs on 2>&1 | grep -c 'JWKS URL override' || true)"
+          expect "table apple_verifications" apple_verifications "$(PGPASSWORD=homegate psql -h 127.0.0.1 -U homegate -d pubky_homegate -Atc "select to_regclass('apple_verifications')")"
+          expect "off POST /apple_verification" 404 "$(code "${forged[@]}" http://127.0.0.1:8081/apple_verification)"
+          expect "off log: no Apple" 0 "$(docker logs off 2>&1 | grep -c 'Apple verification enabled' || true)"
+          docker image ls homegate:staging-check --format 'image size: {{.Size}}'
+          exit "$failed"
+
+      - name: Container logs
+        if: always()
+        run: for c in on off; do echo "== $c"; docker logs "$c" 2>&1 | tail -30; done
